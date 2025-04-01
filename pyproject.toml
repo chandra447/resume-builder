@@ -1,0 +1,23 @@
+[project]
+name = "resume-builder"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.12",
+    "firecrawl-py>=1.15.0",
+    "ipykernel>=6.29.5",
+    "ipynb>=0.5.1",
+    "ipython>=9.0.2",
+    "langchain-anthropic>=0.3.10",
+    "langchain-community>=0.3.20",
+    "langchain-core>=0.3.49",
+    "langchain[fireworks,openai]>=0.3.22",
+    "langgraph>=0.3.21",
+    "langsmith>=0.3.21",
+    "pydantic>=2.11.1",
+    "pydantic-settings>=2.8.1",
+    "pypdf2>=3.0.1",
+    "uvicorn>=0.34.0",
+]
