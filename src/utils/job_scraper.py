@@ -1,77 +1,49 @@
 import re
+from typing import Optional
 
-from bs4 import BeautifulSoup
-from firecrawl import FireCrawl
+from langchain_community.document_loaders import FireCrawlLoader
+from langchain_core.documents import Document
+
+from src.config.settings import settings
 
 
-async def scrape_job_details(url: str) -> str:
+async def scrape_job_details(url: str, api_key: Optional[str] = None) -> str:
     """
-    Scrape job details from a given URL using Firecrawl.
+    Scrape job details from a given URL using FireCrawlLoader.
 
     Args:
         url: The job posting URL
+        api_key: Optional FireCrawl API key. If not provided, will use the one from settings.
 
     Returns:
         str: Extracted job description
     """
     try:
-        # Initialize FireCrawl
-        crawler = FireCrawl()
+        # Initialize FireCrawlLoader
+        loader = FireCrawlLoader(
+            url=url,
+            mode="scrape",  # We only need to scrape the single URL
+            api_key=api_key or settings.firecrawl_api_key,
+        )
 
-        # Fetch the page
-        response = await crawler.get(url)
+        # Load the document
+        docs = loader.load()
 
-        if not response.ok:
-            raise Exception(f"Failed to fetch URL: {response.status_code}")
+        if not docs:
+            raise Exception("No content found at the URL")
 
-        # Parse HTML
-        soup = BeautifulSoup(response.text, "html.parser")
+        # Get the first document (since we're in scrape mode, there should only be one)
+        doc: Document = docs[0]
 
-        # Common job description container classes/IDs
-        job_desc_selectors = [
-            "job-description",
-            "description",
-            "jobDescription",
-            "job-details",
-            "jobDetails",
-            "job-posting",
-            "jobPosting",
-        ]
-
-        # Try to find the job description container
-        job_desc = None
-        for selector in job_desc_selectors:
-            # Try ID
-            job_desc = soup.find(id=selector)
-            if job_desc:
-                break
-            # Try class
-            job_desc = soup.find(class_=selector)
-            if job_desc:
-                break
-
-        # If no specific container found, try to find the largest text block
-        if not job_desc:
-            # Find all paragraph tags
-            paragraphs = soup.find_all("p")
-            if paragraphs:
-                # Get the largest text block
-                job_desc = max(paragraphs, key=lambda p: len(p.get_text()))
-
-        if not job_desc:
-            raise Exception("Could not find job description in the page")
-
-        # Extract and clean text
-        text = job_desc.get_text()
+        # Extract the content
+        content = doc.page_content
 
         # Basic cleaning
-        text = re.sub(r"\s+", " ", text)  # Remove multiple spaces
-        text = re.sub(r"\n\s*\n", "\n\n", text)  # Remove multiple newlines
-        text = text.strip()
+        content = re.sub(r"\s+", " ", content)  # Remove multiple spaces
+        content = re.sub(r"\n\s*\n", "\n\n", content)  # Remove multiple newlines
+        content = content.strip()
 
-        return text
+        return content
 
     except Exception as e:
         raise Exception(f"Error scraping job details: {str(e)}")
-    finally:
-        await crawler.close()

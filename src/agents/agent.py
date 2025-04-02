@@ -1,10 +1,15 @@
-from typing import Dict, List
+from enum import Enum
+from typing import Dict, List, Optional
 
-from langchain_anthropic import ChatAnthropic
+from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph
 from pydantic import BaseModel, Field
 
-llm = ChatAnthropic(model="claude-3-5-sonnet-20240620")
+
+# Define request types
+class RequestType(str, Enum):
+    TAILOR_RESUME = "tailor_resume"
+    DIRECT_EDIT = "direct_edit"
 
 
 # Define schemas for structured output
@@ -32,6 +37,20 @@ class Gap(BaseModel):
     section: str = Field(
         description="Which section contains this evidence or 'Missing'"
     )
+    impact: str = Field(description="How this gap affects job fit")
+
+
+class PrioritizedImprovement(BaseModel):
+    skill: str
+    impact: str = Field(
+        description="high/medium/low - how important is this for the job"
+    )
+    addressability: str = Field(
+        description="high/medium/low - can we reasonably tailor the resume to address this"
+    )
+    priority: int = Field(description="1-10 scale - overall priority to fix")
+    approach: str = Field(description="how should we address this gap")
+    rationale: str = Field(description="Why this improvement is important")
 
 
 class TailoringSuggestion(BaseModel):
@@ -49,18 +68,8 @@ class CompanyContext(BaseModel):
     industry: str = Field(description="Industry specifics")
     terminology: List[str] = Field(description="Key terminology/buzzwords")
     formality: str = Field(description="Level of formality expected")
-
-
-class PrioritizedImprovement(BaseModel):
-    skill: str
-    impact: str = Field(
-        description="high/medium/low - how important is this for the job"
-    )
-    addressability: str = Field(
-        description="high/medium/low - can we reasonably tailor the resume to address this"
-    )
-    priority: int = Field(description="1-10 scale - overall priority to fix")
-    approach: str = Field(description="how should we address this gap")
+    company_size: str = Field(description="Small, Medium, or Large")
+    tech_stack: List[str] = Field(description="List of technologies used")
 
 
 class ATSAnalysis(BaseModel):
@@ -87,17 +96,22 @@ class FinalReview(BaseModel):
     confidence: str = Field(description="Confidence level that resume is well-tailored")
 
 
-# Define state structure
 class AgentState(BaseModel):
-    job_description: str
+    job_description: str = ""
     resume: str
+    request_type: RequestType = RequestType.TAILOR_RESUME
+    user_edit_request: str = ""  # Store the specific edit request
+    edit_section: str = ""  # Section to edit
+    edit_content: str = ""  # Content to add/modify
+    edit_completed: bool = False
     company_context: CompanyContext = None
     requirements: List[Requirement] = []
     matches: List[MatchedSkill] = []
     gaps: List[Gap] = []
     prioritized_improvements: List[PrioritizedImprovement] = []
     tailoring_suggestions: List[TailoringSuggestion] = []
-    verification_queue: List[Dict] = []
+    current_gap_index: int = 0  # Track which gap we're currently processing
+    current_suggestion: Optional[Dict] = None  # Current suggestion being reviewed
     human_feedback: Dict = {}
     tailored_resume: str = ""
     ats_score: float = 0.0
@@ -105,398 +119,579 @@ class AgentState(BaseModel):
     output: str = ""
 
 
-def extract_requirements(state: AgentState) -> AgentState:
-    """Extract key requirements and company context"""
-    # Get job requirements
-    requirements_llm = llm.with_structured_output(List[Requirement])
+class ResumeTailoringAgent:
+    def __init__(self):
+        self.llm = ChatOpenAI(model="gpt-4o-mini")
+        self.workflow = self._build_workflow()
 
-    requirements = requirements_llm.invoke(f"""
-    Extract key requirements from this job description:
-    {state["job_description"]}
-    
-    For each requirement, identify:
-    1. The specific skill or qualification
-    2. Its importance level (High, Medium, Low)
-    3. The experience level required
-    """)
+    def _build_workflow(self) -> StateGraph:
+        """Build and return the workflow graph"""
+        workflow = StateGraph(AgentState)
 
-    state["requirements"] = [req.model_dump() for req in requirements]
+        # Add nodes
+        workflow.add_node("detect_intent", self.detect_intent)
+        workflow.add_node("process_direct_edit", self.process_direct_edit)
+        workflow.add_node("extract_requirements", self.extract_requirements)
+        workflow.add_node("analyze_resume", self.analyze_resume)
+        workflow.add_node("prioritize_improvements", self.prioritize_improvements)
+        workflow.add_node("generate_suggestion", self.generate_suggestion_for_gap)
+        workflow.add_node("request_verification", self.request_human_verification)
+        workflow.add_node("process_feedback", self.process_human_feedback)
+        workflow.add_node("implement_changes", self.implement_changes)
+        workflow.add_node("ats_optimization", self.ats_optimization)
+        workflow.add_node("final_review", self.final_review)
+        workflow.add_node("generate_report", self.generate_report)
 
-    # Get company context
-    context_llm = llm.with_structured_output(CompanyContext)
-    company_context = context_llm.invoke(f"""
-    Analyze this job description and identify:
-    1. Company culture and values
-    2. Industry specifics
-    3. Key terminology/buzzwords
-    4. Level of formality expected
-    
-    Job description:
-    {state["job_description"]}
-    """)
-
-    state["company_context"] = company_context.model_dump()
-    return state
-
-
-def analyze_resume(state: AgentState) -> AgentState:
-    """Analyze resume for matches and gaps against requirements"""
-    matches = []
-    gaps = []
-
-    # Create structured output LLMs
-    match_llm = llm.with_structured_output(MatchedSkill)
-    gap_llm = llm.with_structured_output(Gap)
-
-    for req in state["requirements"]:
-        # First check if this is a match
-        prompt = f"""
-        Does this resume demonstrate {req["skill"]} at {req["experience_level"]} level?
-        
-        Resume:
-        {state["resume"]}
-        
-        If this skill IS demonstrated in the resume, respond with details about the match.
-        If this skill is NOT demonstrated adequately, respond with "NO_MATCH".
-        """
-
-        try:
-            response = match_llm.invoke(prompt)
-            if response != "NO_MATCH":
-                # We have a match
-                matches.append(response.model_dump())
-            else:
-                # We have a gap
-                gap_prompt = f"""
-                The resume does not adequately demonstrate {req["skill"]} at {req["experience_level"]} level.
-                
-                Resume:
-                {state["resume"]}
-                
-                Analyze what evidence (if any) exists in the resume related to this skill,
-                and which section it appears in.
-                """
-                gap = gap_llm.invoke(gap_prompt)
-                gaps.append(
-                    {
-                        **gap.model_dump(),
-                        "skill": req["skill"],
-                        "required_level": req["experience_level"],
-                        "importance": req["importance"],
-                    }
-                )
-        except Exception as e:
-            print(f"Error analyzing requirement {req['skill']}: {e}")
-            continue
-
-    state["matches"] = matches
-    state["gaps"] = gaps
-    return state
-
-
-def prioritize_improvements(state: AgentState) -> AgentState:
-    """Prioritize which improvements will have the biggest impact"""
-    # Sort gaps by importance and ability to address
-    prioritize_llm = llm.with_structured_output(List[PrioritizedImprovement])
-
-    prioritized = prioritize_llm.invoke(f"""
-    Analyze these skill gaps and prioritize which ones should be addressed in the resume:
-    
-    Gaps: {state["gaps"]}
-    Current resume: {state["resume"]}
-    
-    For each gap, determine:
-    1. Impact (high/medium/low) - how important is this for the job?
-    2. Addressability (high/medium/low) - can we reasonably tailor the resume to address this?
-    3. Priority (1-10 scale) - overall priority to fix
-    4. Approach - how should we address this gap?
-    """)
-
-    state["prioritized_improvements"] = [p.model_dump() for p in prioritized]
-    return state
-
-
-def generate_suggestions(state: AgentState) -> AgentState:
-    """Generate specific tailoring suggestions for the resume"""
-    suggestion_llm = llm.with_structured_output(List[TailoringSuggestion])
-
-    suggestions = suggestion_llm.invoke(f"""
-    Create specific suggestions to improve this resume based on the identified gaps:
-    
-    Resume:
-    {state["resume"]}
-    
-    Gaps:
-    {state["gaps"]}
-    
-    Job requirements:
-    {state["requirements"]}
-    
-    For each suggestion, provide:
-    1. The skill being addressed
-    2. Exact section to modify
-    3. Original text (if any)
-    4. Suggested new text
-    5. Explanation of why this change helps
-    6. Confidence in suggestion (high/medium/low)
-    """)
-
-    state["tailoring_suggestions"] = [
-        suggestion.model_dump() for suggestion in suggestions
-    ]
-
-    # Determine which need human verification
-    verification_queue = []
-    for i, suggestion in enumerate(state["tailoring_suggestions"]):
-        if suggestion["confidence"] != "high":
-            verification_queue.append(
-                {
-                    "question_id": i,
-                    "skill": suggestion.get("skill", "Unknown"),
-                    "suggestion_index": i,
-                    "question": f"Should we make this change to the resume?\n\nOriginal: {suggestion['original_text']}\n\nSuggested: {suggestion['new_text']}\n\nRationale: {suggestion['explanation']}",
-                    "options": ["Yes", "No", "Yes with modifications"],
-                    "context": {
-                        "section": suggestion["section"],
-                        "confidence": suggestion["confidence"],
-                    },
-                }
-            )
-
-    state["verification_queue"] = verification_queue
-    return state
-
-
-def request_human_verification(state: AgentState) -> AgentState:
-    """Prepare requests for human verification"""
-    if not state["verification_queue"]:
-        return state
-
-    requests = []
-    for item in state["verification_queue"]:
-        requests.append(
+        # Add branching from intent detection
+        workflow.add_conditional_edges(
+            "detect_intent",
+            self.determine_next_step,
             {
-                "question": f"Should we make this change to the resume?\n\nOriginal: {item['suggestion']['original_text']}\n\nSuggested: {item['suggestion']['new_text']}\n\nRationale: {item['suggestion']['explanation']}",
-                "options": ["Yes", "No", "Yes with modifications"],
-                "context": {
-                    "skill": item["skill"],
-                    "section": item["suggestion"]["section"],
-                    "confidence": item["suggestion"]["confidence"],
-                },
+                "direct_edit": "process_direct_edit",
+                "tailor_resume": "extract_requirements",
+            },
+        )
+
+        # Direct edit path is simple
+        workflow.add_edge("process_direct_edit", "generate_report")
+
+        # Tailoring path remains the same
+        workflow.add_edge("extract_requirements", "analyze_resume")
+        workflow.add_edge("analyze_resume", "prioritize_improvements")
+        workflow.add_edge("prioritize_improvements", "generate_suggestion")
+        workflow.add_edge("generate_suggestion", "request_verification")
+        workflow.add_edge("request_verification", "process_feedback")
+
+        # Add conditional edges
+        workflow.add_conditional_edges(
+            "process_feedback",
+            self.should_continue_processing,
+            {"continue": "generate_suggestion", "complete": "implement_changes"},
+        )
+
+        workflow.add_edge("implement_changes", "ats_optimization")
+        workflow.add_edge("ats_optimization", "final_review")
+        workflow.add_edge("final_review", "generate_report")
+
+        # Set entry point and compile
+        workflow.set_entry_point("detect_intent")
+        return workflow.compile()
+
+    def detect_intent(self, state: AgentState) -> AgentState:
+        """Determine if this is a tailoring request or a direct edit request"""
+
+        # If job description is empty or user specifically asks for an edit
+        intent_llm = self.llm.with_structured_output(
+            {
+                "request_type": str,  # Either "tailor_resume" or "direct_edit"
+                "edit_details": {
+                    "section": str,
+                    "action": str,  # add, modify, remove
+                    "content": str,
+                }
+                if "request_type" == "direct_edit"
+                else None,
             }
         )
 
-    state["human_feedback"] = {"pending_requests": requests}
-    return state
+        request_analysis = intent_llm.invoke(f"""
+        Determine what the user wants to do with their resume based on this input:
+        
+        User request: {state.user_edit_request or "No specific request provided"}
+        Job description provided: {"Yes" if state.job_description else "No"}
+        
+        If the user is asking to make a specific edit to their resume (like adding a skill, 
+        updating a job description, etc.), classify this as a "direct_edit" and extract the details.
+        
+        If the user wants their resume tailored to a job description, classify this as "tailor_resume".
+        
+        Example direct edit requests:
+        - "Add Python to my skills section"
+        - "Update my job title at Google to Senior Engineer"
+        - "Remove my internship at Microsoft"
+        """)
 
+        state.request_type = RequestType(request_analysis["request_type"])
 
-def process_human_feedback(state: AgentState) -> AgentState:
-    """Integrate human verification responses"""
-    if not state["human_feedback"].get("responses"):
+        if state.request_type == RequestType.DIRECT_EDIT:
+            state.edit_section = request_analysis["edit_details"]["section"]
+            state.edit_content = request_analysis["edit_details"]["content"]
+
         return state
 
-    # Update suggestions based on feedback
-    for i, response in enumerate(state["human_feedback"]["responses"]):
+    def determine_next_step(self, state: AgentState) -> str:
+        """Determine whether to follow the direct edit or tailoring path"""
+        if state.request_type == RequestType.DIRECT_EDIT:
+            return "direct_edit"
+        return "tailor_resume"
+
+    def process_direct_edit(self, state: AgentState) -> AgentState:
+        """Make the requested edit directly to the resume"""
+
+        edit_llm = self.llm.invoke(f"""
+        Make the following edit to this resume:
+        
+        Resume:
+        {state.resume}
+        
+        Edit request: {state.user_edit_request}
+        Section to edit: {state.edit_section}
+        Edit content: {state.edit_content}
+        
+        Return the complete updated resume with this specific edit applied.
+        Make sure to maintain the same format and style as the original resume,
+        just with this single change applied.
+        """)
+
+        state.tailored_resume = edit_llm
+        state.edit_completed = True
+
+        # Generate a simple report about what was changed
+        state.output = f"""
+        # Resume Edit Complete
+        
+        I've updated your resume by making the following change:
+        
+        **Section**: {state.edit_section}
+        **Change**: {state.user_edit_request}
+        
+        ## Updated Resume
+        
+        {state.tailored_resume}
+        """
+
+        return state
+
+    def extract_requirements(self, state: AgentState) -> AgentState:
+        """Extract requirements from job description"""
+        requirements_llm = self.llm.with_structured_output(List[Requirement])
+
+        requirements = requirements_llm.invoke(f"""
+        Extract key requirements from this job description:
+        {state.job_description}
+        
+        For each requirement, specify:
+        1. The skill or qualification
+        2. Importance level (High/Medium/Low)
+        3. Required experience level
+        """)
+
+        state.requirements = requirements
+
+        # Get company context
+        context_llm = self.llm.with_structured_output(CompanyContext)
+        company_context = context_llm.invoke(f"""
+        Analyze this job description and identify:
+        1. Company culture and values
+        2. Industry specifics
+        3. Key terminology/buzzwords
+        4. Level of formality expected
+        5. Company size (Small/Medium/Large)
+        6. Technology stack mentioned
+        
+        Job description:
+        {state.job_description}
+        """)
+
+        state.company_context = company_context
+        return state
+
+    def analyze_resume(self, state: AgentState) -> AgentState:
+        """Analyze resume against job requirements"""
+        matches = []
+        gaps = []
+
+        # Create structured output LLMs
+        match_llm = self.llm.with_structured_output(MatchedSkill)
+        gap_llm = self.llm.with_structured_output(Gap)
+
+        for req in state.requirements:
+            # First check if this is a match
+            prompt = f"""
+            Does this resume demonstrate {req.skill} at {req.experience_level} level?
+            
+            Resume:
+            {state.resume}
+            
+            If this skill IS demonstrated in the resume, respond with details about the match.
+            If this skill is NOT demonstrated adequately, respond with "NO_MATCH".
+            """
+
+            try:
+                response = match_llm.invoke(prompt)
+                if response != "NO_MATCH":
+                    # We have a match
+                    matches.append(response)
+                else:
+                    # We have a gap
+                    gap_prompt = f"""
+                    The resume does not adequately demonstrate {req.skill} at {req.experience_level} level.
+                    
+                    Resume:
+                    {state.resume}
+                    
+                    Analyze what evidence (if any) exists in the resume related to this skill,
+                    and which section it appears in.
+                    """
+                    gap = gap_llm.invoke(gap_prompt)
+                    gaps.append(
+                        Gap(
+                            skill=req.skill,
+                            required_level=req.experience_level,
+                            importance=req.importance,
+                            resume_evidence=gap.resume_evidence,
+                            section=gap.section,
+                            impact=f"Missing {req.skill} at {req.experience_level} level",
+                        )
+                    )
+            except Exception as e:
+                print(f"Error analyzing requirement {req.skill}: {e}")
+                continue
+
+        state.matches = matches
+        state.gaps = gaps
+        state.current_gap_index = 0  # Initialize the gap index
+        return state
+
+    def prioritize_improvements(self, state: AgentState) -> AgentState:
+        """Prioritize which improvements will have the biggest impact"""
+        # Sort gaps by importance and ability to address
+        prioritize_llm = self.llm.with_structured_output(List[PrioritizedImprovement])
+
+        prioritized = prioritize_llm.invoke(f"""
+        Analyze these skill gaps and prioritize which ones should be addressed in the resume:
+        
+        Gaps: {state.gaps}
+        Current resume: {state.resume}
+        
+        For each gap, determine:
+        1. Impact (high/medium/low) - how important is this for the job?
+        2. Addressability (high/medium/low) - can we reasonably tailor the resume to address this?
+        3. Priority (1-10 scale) - overall priority to fix
+        4. Approach - how should we address this gap?
+        5. Rationale - why is this improvement important?
+        """)
+
+        state.prioritized_improvements = prioritized
+
+        # Sort gaps by priority
+        if state.prioritized_improvements:
+            # Create a mapping of skill to priority
+            priority_map = {p.skill: p.priority for p in state.prioritized_improvements}
+
+            # Sort gaps by priority (highest first)
+            state.gaps = sorted(
+                state.gaps,
+                key=lambda gap: priority_map.get(gap.skill, 0),
+                reverse=True,
+            )
+
+        return state
+
+    def generate_suggestion_for_gap(self, state: AgentState) -> AgentState:
+        """Generate a suggestion for the current gap"""
+        if state.current_gap_index >= len(state.gaps):
+            return state
+
+        current_gap = state.gaps[state.current_gap_index]
+        suggestion_llm = self.llm.with_structured_output(TailoringSuggestion)
+
+        suggestion = suggestion_llm.invoke(f"""
+        Create a specific suggestion to improve this resume based on the identified gap:
+        
+        Resume:
+        {state.resume}
+        
+        Gap:
+        {current_gap}
+        
+        Job requirements:
+        {state.requirements}
+        
+        Provide:
+        1. The skill being addressed
+        2. Exact section to modify
+        3. Original text (if any)
+        4. Suggested new text
+        5. Explanation of why this change helps
+        6. Confidence in suggestion (high/medium/low)
+        """)
+
+        if not state.tailoring_suggestions:
+            state.tailoring_suggestions = []
+
+        state.tailoring_suggestions.append(suggestion)
+        state.current_suggestion = suggestion.model_dump()
+        return state
+
+    def request_human_verification(self, state: AgentState) -> AgentState:
+        """Request human verification of the current suggestion"""
+        if not state.current_suggestion:
+            return state
+
+        # Create a verification request for the current suggestion
+        suggestion = state.current_suggestion
+
+        # Determine if this needs human verification
+        if suggestion["confidence"] == "high":
+            # High confidence suggestions are automatically approved
+            suggestion["approved"] = True
+            state.human_feedback = {"current_response": {"answer": "Yes"}}
+        else:
+            # Create a verification request
+            state.human_feedback = {
+                "current_response": None,
+                "pending_request": {
+                    "question": f"Should we make this change to the resume?\n\nOriginal: {suggestion['original_text']}\n\nSuggested: {suggestion['new_text']}\n\nRationale: {suggestion['explanation']}",
+                    "options": ["Yes", "No", "Yes with modifications"],
+                    "context": {
+                        "skill": suggestion["skill"],
+                        "section": suggestion["section"],
+                        "confidence": suggestion["confidence"],
+                    },
+                },
+            }
+
+        return state
+
+    def process_human_feedback(self, state: AgentState) -> AgentState:
+        """Process feedback from human verification"""
+        if not state.human_feedback.get("current_response"):
+            # No feedback yet, keep waiting
+            return state
+
+        # Get the current suggestion
+        suggestion = state.current_suggestion
+
+        # Process the feedback
+        response = state.human_feedback["current_response"]
+
         if response["answer"] == "Yes":
             # Keep suggestion as is
-            pass
+            suggestion["approved"] = True
         elif response["answer"] == "No":
             # Remove this suggestion
-            state["tailoring_suggestions"][i]["approved"] = False
+            suggestion["approved"] = False
         elif response["answer"] == "Yes with modifications":
             # Update suggestion with human modifications
-            state["tailoring_suggestions"][i]["new_text"] = response.get(
-                "modified_text", state["tailoring_suggestions"][i]["new_text"]
+            suggestion["new_text"] = response.get(
+                "modified_text", suggestion["new_text"]
             )
-            state["tailoring_suggestions"][i]["approved"] = True
+            suggestion["approved"] = True
 
-    return state
+        # Move to the next gap
+        state.current_gap_index += 1
+        return state
 
+    def should_continue_processing(self, state: AgentState) -> str:
+        """Determine if we should continue processing gaps"""
+        if state.current_gap_index < len(state.gaps):
+            return "continue"
+        return "complete"
 
-def implement_changes(state: AgentState) -> AgentState:
-    """Implement approved changes to create tailored resume"""
-    current_resume = state["resume"]
+    def implement_changes(self, state: AgentState) -> AgentState:
+        """Implement approved changes to create tailored resume"""
+        changes_by_section = {}
+        for suggestion in state.tailoring_suggestions:
+            if suggestion.approved:
+                section = suggestion.section
+                if section not in changes_by_section:
+                    changes_by_section[section] = []
+                changes_by_section[section].append(suggestion.model_dump())
 
-    # Group changes by section for more coherent implementation
-    changes_by_section = {}
-    for suggestion in state["tailoring_suggestions"]:
-        if suggestion.get("approved", True):  # Default to True if not specified
-            section = suggestion["section"]
-            if section not in changes_by_section:
-                changes_by_section[section] = []
-            changes_by_section[section].append(suggestion)
-
-    # Apply the changes
-    updated_resume = llm.invoke(f"""
-    Update this resume with the following changes:
-    
-    Current resume:
-    {current_resume}
-    
-    Changes to make by section:
-    {changes_by_section}
-    
-    Requirements from job:
-    {state["requirements"]}
-    
-    Company context:
-    {state["company_context"]}
-    
-    Return the complete updated resume in the same format as the original.
-    """)
-
-    state["tailored_resume"] = updated_resume
-    return state
-
-
-def ats_optimization(state: AgentState) -> AgentState:
-    """Optimize resume for ATS systems"""
-    ats_llm = llm.with_structured_output(ATSAnalysis)
-
-    ats_analysis = ats_llm.invoke(f"""
-    Analyze this resume for ATS optimization:
-    {state["tailored_resume"]}
-    
-    Job description:
-    {state["job_description"]}
-    
-    Check for:
-    1. Keyword density compared to job description
-    2. Use of industry-standard job titles
-    3. Proper formatting that won't confuse ATS systems
-    4. Appropriate use of bullet points and sections
-    """)
-
-    state["ats_score"] = ats_analysis.score
-
-    # Apply ATS optimizations if score is low
-    if ats_analysis.score < 80:
-        optimized = llm.invoke(f"""
-        Update this resume to improve ATS compatibility by addressing these issues:
+        updated_resume = self.llm.invoke(f"""
+        Update this resume with the following changes to create a tailored version:
         
         Current resume:
-        {state["tailored_resume"]}
+        {state.resume}
         
-        Improvements needed:
-        {ats_analysis.improvements}
+        Changes to make by section:
+        {changes_by_section}
         
-        Return the complete updated resume with better ATS optimization.
+        Requirements from job:
+        {state.requirements}
+        
+        Company context:
+        {state.company_context}
+        
+        FORMAT THE RESULT WITH THESE SECTIONS in this order:
+        1. Full name at the top
+        2. Current professional title
+        3. Professional summary (concise paragraph highlighting key qualifications)
+        4. Skills (comprehensive list of technical and soft skills relevant to the job)
+        5. Work Experience (chronological, with company, title, dates, and key projects/accomplishments)
+        6. Education (degrees, institutions, and dates)
+        
+        Make sure to integrate all the approved changes while maintaining this structure.
         """)
-        state["tailored_resume"] = optimized
 
-    return state
+        state.tailored_resume = updated_resume
+        return state
 
+    def ats_optimization(self, state: AgentState) -> AgentState:
+        """Optimize resume for ATS systems"""
+        ats_llm = self.llm.with_structured_output(ATSAnalysis)
 
-def final_review(state: AgentState) -> AgentState:
-    """Final review and polish of the resume"""
-    review_llm = llm.with_structured_output(FinalReview)
-
-    final_review = review_llm.invoke(f"""
-    Perform a final review of this tailored resume:
-    {state["tailored_resume"]}
-    
-    Job description:
-    {state["job_description"]}
-    
-    Check for:
-    1. Overall coherence and flow
-    2. Appropriate highlighting of key qualifications
-    3. Consistency in formatting and style
-    4. Grammar and spelling
-    5. Appropriate length and detail level
-    """)
-
-    # Make final adjustments if needed
-    if final_review.adjustments:
-        polished = llm.invoke(f"""
-        Make these final adjustments to the resume:
+        ats_analysis = ats_llm.invoke(f"""
+        Analyze this resume for ATS optimization:
+        {state.tailored_resume}
         
-        Current resume:
-        {state["tailored_resume"]}
+        Job description:
+        {state.job_description}
         
-        Adjustments:
-        {final_review.adjustments}
-        
-        Return the complete finalized resume.
+        Check for:
+        1. Keyword density compared to job description
+        2. Use of industry-standard job titles
+        3. Proper formatting that won't confuse ATS systems
+        4. Appropriate use of bullet points and sections
         """)
-        state["tailored_resume"] = polished
 
-    state["final_notes"] = final_review.strengths
-    return state
+        state.ats_score = ats_analysis.score
 
+        if ats_analysis.score < 80:
+            optimized = self.llm.invoke(f"""
+            Update this resume to improve ATS compatibility by addressing these issues:
+            
+            Current resume:
+            {state.tailored_resume}
+            
+            Improvements needed:
+            {ats_analysis.improvements}
+            
+            Return the complete updated resume with better ATS optimization.
+            """)
+            state.tailored_resume = optimized
 
-def generate_report(state: AgentState) -> AgentState:
-    """Generate final tailored resume with summary"""
-    summary = f"""
-    # Resume Tailoring Summary
-    
-    ## Job Fit Analysis
-    - Matched Skills: {len(state["matches"])}
-    - Addressed Gaps: {len([g for g in state["gaps"] if g["skill"] in [s["skill"] for s in state["tailoring_suggestions"]]])}
-    - ATS Compatibility Score: {state["ats_score"]}/100
-    
-    ## Key Improvements Made
-    """
+        return state
 
-    for suggestion in state["tailoring_suggestions"]:
-        if suggestion.get("approved", True):
-            summary += f"- {suggestion['section']}: {suggestion['explanation']}\n"
+    def final_review(self, state: AgentState) -> AgentState:
+        """Final review and polish of the resume"""
+        review_llm = self.llm.with_structured_output(FinalReview)
 
-    summary += "\n## Resume Strengths\n"
-    for note in state["final_notes"]:
-        summary += f"- {note}\n"
+        final_review = review_llm.invoke(f"""
+        Perform a final review of this tailored resume:
+        {state.tailored_resume}
+        
+        Job description:
+        {state.job_description}
+        
+        Check for:
+        1. Overall coherence and flow
+        2. Appropriate highlighting of key qualifications
+        3. Consistency in formatting and style
+        4. Grammar and spelling
+        5. Appropriate length and detail level
+        """)
 
-    summary += f"\n## Tailored Resume\n\n{state['tailored_resume']}"
+        if final_review.adjustments:
+            polished = self.llm.invoke(f"""
+            Make these final adjustments to the resume:
+            
+            Current resume:
+            {state.tailored_resume}
+            
+            Adjustments:
+            {final_review.adjustments}
+            
+            Return the complete finalized resume.
+            """)
+            state.tailored_resume = polished
 
-    state["output"] = summary
-    return state
+        state.final_notes = final_review.strengths
+        return state
 
+    def generate_report(self, state: AgentState) -> AgentState:
+        """Generate final tailored resume with summary in markdown format"""
+        # If this was a direct edit, we already have the output
+        if state.edit_completed:
+            return state
 
-def should_verify(state: AgentState) -> str:
-    """Conditional edge to determine if human verification is needed"""
-    if state["verification_queue"]:
-        return "needs_verification"
-    return "no_verification_needed"
+        summary = f"""
+        # Resume Tailoring Summary
+        
+        ## Job Fit Analysis
+        - Matched Skills: {len(state.matches)}
+        - Addressed Gaps: {len([g for g in state.gaps if g.skill in [s.skill for s in state.tailoring_suggestions]])}
+        - ATS Compatibility Score: {state.ats_score}/100
+        
+        ## Key Improvements Made
+        """
 
+        for suggestion in state.tailoring_suggestions:
+            if suggestion.approved:
+                summary += f"- {suggestion.section}: {suggestion.explanation}\n"
 
-# Build the graph
-workflow = StateGraph(AgentState)
+        summary += "\n## Resume Strengths\n"
+        for note in state.final_notes:
+            summary += f"- {note}\n"
 
-# Add nodes
-workflow.add_node("extract_requirements", extract_requirements)
-workflow.add_node("analyze_resume", analyze_resume)
-workflow.add_node("prioritize_improvements", prioritize_improvements)
-workflow.add_node("generate_suggestions", generate_suggestions)
-workflow.add_node("request_verification", request_human_verification)
-workflow.add_node("process_feedback", process_human_feedback)
-workflow.add_node("implement_changes", implement_changes)
-workflow.add_node("ats_optimization", ats_optimization)
-workflow.add_node("final_review", final_review)
-workflow.add_node("generate_report", generate_report)
+        resume_structure_llm = self.llm.with_structured_output(dict)
 
-# Add edges
-workflow.add_edge("extract_requirements", "analyze_resume")
-workflow.add_edge("analyze_resume", "prioritize_improvements")
-workflow.add_edge("prioritize_improvements", "generate_suggestions")
-workflow.add_edge("generate_suggestions", "request_verification")
+        resume_components = resume_structure_llm.invoke(f"""
+        Extract the following components from this resume:
+        - name: The candidate's full name
+        - current_title: Their current professional title
+        - professional_summary: A paragraph summarizing their professional background
+        - skills: A comprehensive list of all skills mentioned (technical and soft skills)
+        - work_experience: List of all work experiences with company, title, dates, and key projects/accomplishments
+        - education: List of educational background with degree, institution, and dates
+        
+        Resume:
+        {state.tailored_resume}
+        
+        Return these components in a structured format.
+        """)
 
-# Add conditional edges
-workflow.add_conditional_edges(
-    "request_verification",
-    should_verify,
-    {
-        "needs_verification": "process_feedback",
-        "no_verification_needed": "implement_changes",
-    },
-)
+        # Format the resume in markdown
+        final_resume_markdown = f"# {resume_components['name']}\n\n"
+        final_resume_markdown += f"## {resume_components['current_title']}\n\n"
+        final_resume_markdown += f"{resume_components['professional_summary']}\n\n"
 
-workflow.add_edge("process_feedback", "implement_changes")
-workflow.add_edge("implement_changes", "ats_optimization")
-workflow.add_edge("ats_optimization", "final_review")
-workflow.add_edge("final_review", "generate_report")
+        final_resume_markdown += "## Skills\n\n"
+        skills = resume_components["skills"]
+        if isinstance(skills, list):
+            for skill in skills:
+                final_resume_markdown += f"- {skill}\n"
+        else:
+            final_resume_markdown += f"{skills}\n"
 
-# Set entry point
-workflow.set_entry_point("extract_requirements")
+        final_resume_markdown += "\n## Work Experience\n\n"
+        work_exp = resume_components["work_experience"]
 
-# Compile
-app = workflow.compile()
+        if isinstance(work_exp, list):
+            for job in work_exp:
+                final_resume_markdown += (
+                    f"### {job.get('title')} | {job.get('company')}\n"
+                )
+                final_resume_markdown += f"*{job.get('dates')}*\n\n"
+
+                if "projects" in job and isinstance(job["projects"], list):
+                    final_resume_markdown += "**Key Projects:**\n\n"
+                    for project in job["projects"]:
+                        final_resume_markdown += f"- **{project.get('name', 'Project')}**: {project.get('description', '')}\n"
+
+                if "accomplishments" in job and isinstance(
+                    job["accomplishments"], list
+                ):
+                    final_resume_markdown += "\n**Accomplishments:**\n\n"
+                    for accomplishment in job["accomplishments"]:
+                        final_resume_markdown += f"- {accomplishment}\n"
+
+                final_resume_markdown += "\n"
+        else:
+            final_resume_markdown += f"{work_exp}\n"
+
+        final_resume_markdown += "\n## Education\n\n"
+        education = resume_components["education"]
+        if isinstance(education, list):
+            for edu in education:
+                final_resume_markdown += f"**{edu.get('degree')}** - {edu.get('institution')}, {edu.get('dates')}\n\n"
+        else:
+            final_resume_markdown += f"{education}\n"
+
+        state.output = f"{summary}\n\n## Final Tailored Resume\n{final_resume_markdown}"
+        return state
+
+    async def run(self, initial_state: AgentState) -> AgentState:
+        """Run the workflow with the given initial state"""
+        return await self.workflow.arun(initial_state)
