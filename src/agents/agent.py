@@ -121,7 +121,11 @@ class AgentState(BaseModel):
 
 class ResumeTailoringAgent:
     def __init__(self):
-        self.llm = ChatOpenAI(model="gpt-4o-mini")
+        # Use environment variables for API key (no hardcoded keys)
+        self.llm = ChatOpenAI(
+            model="gpt-4o-mini",
+            temperature=0.0,  # Set temperature for deterministic outputs
+        )
         self.workflow = self._build_workflow()
 
     def _build_workflow(self) -> StateGraph:
@@ -181,18 +185,23 @@ class ResumeTailoringAgent:
         """Determine if this is a tailoring request or a direct edit request"""
 
         # If job description is empty or user specifically asks for an edit
-        intent_llm = self.llm.with_structured_output(
-            {
-                "request_type": str,  # Either "tailor_resume" or "direct_edit"
-                "edit_details": {
-                    "section": str,
-                    "action": str,  # add, modify, remove
-                    "content": str,
-                }
-                if "request_type" == "direct_edit"
-                else None,
-            }
-        )
+        # Define a proper pydantic model for structured output
+        from typing import Optional
+
+        from pydantic import BaseModel, Field
+
+        class EditDetails(BaseModel):
+            section: str = Field(description="Section of the resume to edit")
+            action: str = Field(description="Action to take: add, modify, or remove")
+            content: str = Field(description="Content to add or modify")
+
+        class RequestAnalysis(BaseModel):
+            request_type: str = Field(description="Either 'tailor_resume' or 'direct_edit'")
+            edit_details: Optional[EditDetails] = Field(
+                None, description="Details for direct edit request"
+            )
+
+        intent_llm = self.llm.with_structured_output(RequestAnalysis)
 
         request_analysis = intent_llm.invoke(f"""
         Determine what the user wants to do with their resume based on this input:
@@ -211,11 +220,12 @@ class ResumeTailoringAgent:
         - "Remove my internship at Microsoft"
         """)
 
-        state.request_type = RequestType(request_analysis["request_type"])
+        # Access the Pydantic model using dot notation instead of dictionary access
+        state.request_type = RequestType(request_analysis.request_type)
 
-        if state.request_type == RequestType.DIRECT_EDIT:
-            state.edit_section = request_analysis["edit_details"]["section"]
-            state.edit_content = request_analysis["edit_details"]["content"]
+        if state.request_type == RequestType.DIRECT_EDIT and request_analysis.edit_details:
+            state.edit_section = request_analysis.edit_details.section
+            state.edit_content = request_analysis.edit_details.content
 
         return state
 
