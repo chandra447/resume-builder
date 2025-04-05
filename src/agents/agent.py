@@ -1,99 +1,24 @@
-from enum import Enum
 from typing import Dict, List, Optional
 
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph
 from pydantic import BaseModel, Field
 
+from src.agents.models.states import (
+    ATSAnalysis,
+    CompanyContext,
+    FinalReview,
+    Gap,
+    MatchedSkill,
+    PrioritizedImprovement,
+    RequestType,
+    Requirement,
+    TailoringSuggestion,
+)
+from src.config.settings import settings
+from src.utils.logger_config import setup_logger
 
-# Define request types
-class RequestType(str, Enum):
-    TAILOR_RESUME = "tailor_resume"
-    DIRECT_EDIT = "direct_edit"
-
-
-# Define schemas for structured output
-class Requirement(BaseModel):
-    skill: str
-    importance: str = Field(description="High, Medium, or Low importance")
-    experience_level: str = Field(description="Required experience level")
-
-
-class MatchedSkill(BaseModel):
-    skill: str
-    evidence: str
-    section: str
-    confidence: str = Field(description="high, medium, or low")
-    relevance: str = Field(
-        description="How directly the evidence relates to the requirement"
-    )
-
-
-class Gap(BaseModel):
-    skill: str
-    required_level: str
-    importance: str
-    resume_evidence: str = Field(description="Evidence from resume or 'None found'")
-    section: str = Field(
-        description="Which section contains this evidence or 'Missing'"
-    )
-    impact: str = Field(description="How this gap affects job fit")
-
-
-class PrioritizedImprovement(BaseModel):
-    skill: str
-    impact: str = Field(
-        description="high/medium/low - how important is this for the job"
-    )
-    addressability: str = Field(
-        description="high/medium/low - can we reasonably tailor the resume to address this"
-    )
-    priority: int = Field(description="1-10 scale - overall priority to fix")
-    approach: str = Field(description="how should we address this gap")
-    rationale: str = Field(description="Why this improvement is important")
-
-
-class TailoringSuggestion(BaseModel):
-    skill: str
-    section: str = Field(description="Resume section to modify")
-    original_text: str = Field(description="Original text from resume, if any")
-    new_text: str = Field(description="Suggested new text")
-    explanation: str = Field(description="Why this change helps")
-    confidence: str = Field(description="high, medium, or low")
-    approved: bool = True
-
-
-class CompanyContext(BaseModel):
-    culture: str = Field(description="Company culture and values")
-    industry: str = Field(description="Industry specifics")
-    terminology: List[str] = Field(description="Key terminology/buzzwords")
-    formality: str = Field(description="Level of formality expected")
-    company_size: str = Field(description="Small, Medium, or Large")
-    tech_stack: List[str] = Field(description="List of technologies used")
-
-
-class ATSAnalysis(BaseModel):
-    score: float = Field(description="ATS compatibility score (0-100)")
-    keyword_density: Dict[str, float] = Field(
-        description="Keyword frequency compared to job description"
-    )
-    job_title_matches: List[str] = Field(
-        description="Industry-standard job titles found"
-    )
-    format_issues: List[str] = Field(
-        description="Formatting issues that might confuse ATS"
-    )
-    improvements: List[str] = Field(
-        description="Specific improvements to increase ATS compatibility"
-    )
-
-
-class FinalReview(BaseModel):
-    adjustments: List[str] = Field(description="Final adjustments to make")
-    strengths: List[str] = Field(
-        description="Notes on strengths of the tailored resume"
-    )
-    confidence: str = Field(description="Confidence level that resume is well-tailored")
+logger = setup_logger(__name__)
 
 
 class AgentState(BaseModel):
@@ -117,6 +42,10 @@ class AgentState(BaseModel):
     ats_score: float = 0.0
     final_notes: List[str] = []
     output: str = ""
+    # Human-in-the-loop fields
+    waiting_for_human: bool = False  # Whether we're waiting for human input
+    human_question: str = ""  # Question to ask the human
+    step_name: str = ""  # Current step in the workflow
 
 
 class ResumeTailoringAgent:
@@ -125,6 +54,7 @@ class ResumeTailoringAgent:
         self.llm = ChatOpenAI(
             model="gpt-4o-mini",
             temperature=0.0,  # Set temperature for deterministic outputs
+            api_key=settings.openai_api_key,
         )
         self.workflow = self._build_workflow()
 
@@ -146,6 +76,9 @@ class ResumeTailoringAgent:
         workflow.add_node("final_review", self.final_review)
         workflow.add_node("generate_report", self.generate_report)
 
+        # Add human-in-the-loop interrupt node
+        workflow.add_node("human_input", lambda x: x)
+
         # Add branching from intent detection
         workflow.add_conditional_edges(
             "detect_intent",
@@ -159,12 +92,17 @@ class ResumeTailoringAgent:
         # Direct edit path is simple
         workflow.add_edge("process_direct_edit", "generate_report")
 
-        # Tailoring path remains the same
+        # Tailoring path with human-in-the-loop
         workflow.add_edge("extract_requirements", "analyze_resume")
         workflow.add_edge("analyze_resume", "prioritize_improvements")
         workflow.add_edge("prioritize_improvements", "generate_suggestion")
         workflow.add_edge("generate_suggestion", "request_verification")
-        workflow.add_edge("request_verification", "process_feedback")
+
+        # Add interrupt edge from request_verification to human_input
+        workflow.add_edge("request_verification", "human_input", interrupt=True)
+
+        # After human input is received, continue with process_feedback
+        workflow.add_edge("human_input", "process_feedback")
 
         # Add conditional edges
         workflow.add_conditional_edges(
@@ -186,9 +124,6 @@ class ResumeTailoringAgent:
 
         # If job description is empty or user specifically asks for an edit
         # Define a proper pydantic model for structured output
-        from typing import Optional
-
-        from pydantic import BaseModel, Field
 
         class EditDetails(BaseModel):
             section: str = Field(description="Section of the resume to edit")
@@ -196,7 +131,9 @@ class ResumeTailoringAgent:
             content: str = Field(description="Content to add or modify")
 
         class RequestAnalysis(BaseModel):
-            request_type: str = Field(description="Either 'tailor_resume' or 'direct_edit'")
+            request_type: str = Field(
+                description="Either 'tailor_resume' or 'direct_edit'"
+            )
             edit_details: Optional[EditDetails] = Field(
                 None, description="Details for direct edit request"
             )
@@ -223,7 +160,10 @@ class ResumeTailoringAgent:
         # Access the Pydantic model using dot notation instead of dictionary access
         state.request_type = RequestType(request_analysis.request_type)
 
-        if state.request_type == RequestType.DIRECT_EDIT and request_analysis.edit_details:
+        if (
+            state.request_type == RequestType.DIRECT_EDIT
+            and request_analysis.edit_details
+        ):
             state.edit_section = request_analysis.edit_details.section
             state.edit_content = request_analysis.edit_details.content
 
@@ -275,7 +215,7 @@ class ResumeTailoringAgent:
     def extract_requirements(self, state: AgentState) -> AgentState:
         """Extract requirements from job description"""
         requirements_llm = self.llm.with_structured_output(List[Requirement])
-
+        logger.info("Extracting requirements from job description")
         requirements = requirements_llm.invoke(f"""
         Extract key requirements from this job description:
         {state.job_description}
@@ -290,6 +230,7 @@ class ResumeTailoringAgent:
 
         # Get company context
         context_llm = self.llm.with_structured_output(CompanyContext)
+        logger.info("Getting company context")
         company_context = context_llm.invoke(f"""
         Analyze this job description and identify:
         1. Company culture and values
@@ -447,12 +388,19 @@ class ResumeTailoringAgent:
             # High confidence suggestions are automatically approved
             suggestion["approved"] = True
             state.human_feedback = {"current_response": {"answer": "Yes"}}
+            # No need to interrupt for high confidence suggestions
+            state.waiting_for_human = False
         else:
+            # Set up state for human interruption
+            state.waiting_for_human = True
+            state.step_name = "request_verification"
+            state.human_question = f"Should we make this change to the resume?\n\nOriginal: {suggestion['original_text']}\n\nSuggested: {suggestion['new_text']}\n\nRationale: {suggestion['explanation']}"
+
             # Create a verification request
             state.human_feedback = {
                 "current_response": None,
                 "pending_request": {
-                    "question": f"Should we make this change to the resume?\n\nOriginal: {suggestion['original_text']}\n\nSuggested: {suggestion['new_text']}\n\nRationale: {suggestion['explanation']}",
+                    "question": state.human_question,
                     "options": ["Yes", "No", "Yes with modifications"],
                     "context": {
                         "skill": suggestion["skill"],
@@ -461,6 +409,9 @@ class ResumeTailoringAgent:
                     },
                 },
             }
+
+            # Set output message for the frontend
+            state.output = f"Waiting for human verification on suggested change for {suggestion['skill']}"
 
         return state
 
@@ -704,4 +655,39 @@ class ResumeTailoringAgent:
 
     async def run(self, initial_state: AgentState) -> AgentState:
         """Run the workflow with the given initial state"""
-        return await self.workflow.arun(initial_state)
+        # If we have human feedback, we're resuming from an interrupt
+        if initial_state.human_feedback and initial_state.waiting_for_human:
+            # Reset the waiting flag since we're continuing with human input
+            initial_state.waiting_for_human = False
+
+            # Try different async methods based on the LangGraph version
+            try:
+                # First try the newer method with the human_input node
+                return await self.workflow.ainvoke(
+                    initial_state, {"checkpoint": "human_input"}
+                )
+            except (AttributeError, ValueError):
+                try:
+                    # Then try the alternative method
+                    return await self.workflow.invoke_async(
+                        initial_state, {"checkpoint": "human_input"}
+                    )
+                except (AttributeError, ValueError):
+                    # Fall back to compiled graph method
+                    compiled = self.workflow.compile()
+                    return await compiled.ainvoke(
+                        initial_state, {"checkpoint": "human_input"}
+                    )
+        else:
+            # Starting from the beginning
+            try:
+                # First try the newer method
+                return await self.workflow.ainvoke(initial_state)
+            except AttributeError:
+                try:
+                    # Then try the alternative method
+                    return await self.workflow.invoke_async(initial_state)
+                except AttributeError:
+                    # Fall back to compiled graph method
+                    compiled = self.workflow.compile()
+                    return await compiled.ainvoke(initial_state)

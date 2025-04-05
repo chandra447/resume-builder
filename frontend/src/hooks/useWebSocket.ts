@@ -1,25 +1,34 @@
 import { useState, useCallback, useEffect } from 'react';
 
-interface WebSocketMessage {
-    type: 'human_input_required' | 'progress_update' | 'resume_update';
+export interface WebSocketMessage {
+    type: string;
     question?: string;
     message?: string;
     content?: string;
+    data?: string;
+    state?: any;
 }
 
-export function useWebSocket() {
+export function useWebSocket(url: string | null) {
     const [socket, setSocket] = useState<WebSocket | null>(null);
     const [lastMessage, setLastMessage] = useState<WebSocketMessage | null>(null);
     const [connected, setConnected] = useState(false);
 
-    const connect = useCallback((url: string) => {
-        if (socket) {
-            socket.close();
+    // Connect to WebSocket when URL is provided
+    useEffect(() => {
+        if (!url) {
+            if (socket) {
+                socket.close();
+                setSocket(null);
+                setConnected(false);
+            }
+            return;
         }
 
         const ws = new WebSocket(url);
 
         ws.onopen = () => {
+            console.log('WebSocket connected');
             setConnected(true);
         };
 
@@ -33,6 +42,7 @@ export function useWebSocket() {
         };
 
         ws.onclose = () => {
+            console.log('WebSocket disconnected');
             setConnected(false);
         };
 
@@ -42,33 +52,22 @@ export function useWebSocket() {
         };
 
         setSocket(ws);
-    }, []);
 
-    const disconnect = useCallback(() => {
-        if (socket) {
-            socket.close();
-            setSocket(null);
-            setConnected(false);
-        }
-    }, [socket]);
+        // Cleanup function
+        return () => {
+            ws.close();
+        };
+    }, [url]);
 
     const sendMessage = useCallback((message: string) => {
         if (socket && socket.readyState === WebSocket.OPEN) {
             socket.send(JSON.stringify({ message }));
+        } else {
+            console.warn('WebSocket is not connected');
         }
     }, [socket]);
 
-    useEffect(() => {
-        return () => {
-            if (socket) {
-                socket.close();
-            }
-        };
-    }, [socket]);
-
     return {
-        connect,
-        disconnect,
         sendMessage,
         lastMessage,
         connected

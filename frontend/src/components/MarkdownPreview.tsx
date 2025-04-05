@@ -59,13 +59,18 @@ const PreviewContainer = styled(Paper)(({ theme }) => ({
 
 interface MarkdownPreviewProps {
     content: string;
+    markdown?: string; // Add optional markdown prop for backward compatibility
 }
 
-export const MarkdownPreview: React.FC<MarkdownPreviewProps> = ({ content }) => {
+export const MarkdownPreview: React.FC<MarkdownPreviewProps> = ({ content, markdown }) => {
+    // Use either content or markdown prop, with content taking precedence
+    const markdownContent = content || markdown || '';
+    
     return (
         <PreviewContainer elevation={0}>
             <ReactMarkdown
                 components={{
+                    // @ts-ignore - Ignoring TypeScript errors for code component
                     code({ node, inline, className, children, ...props }) {
                         const match = /language-(\w+)/.exec(className || '');
                         return !inline && match ? (
@@ -85,7 +90,7 @@ export const MarkdownPreview: React.FC<MarkdownPreviewProps> = ({ content }) => 
                     },
                 }}
             >
-                {content}
+                {markdownContent}
             </ReactMarkdown>
         </PreviewContainer>
     );

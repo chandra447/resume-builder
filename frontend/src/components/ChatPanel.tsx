@@ -4,7 +4,6 @@ import {
     Paper,
     Typography,
     TextField,
-    Button,
     CircularProgress,
     IconButton,
 } from '@mui/material';
@@ -12,7 +11,7 @@ import { Send as SendIcon } from '@mui/icons-material';
 import { styled } from '@mui/material/styles';
 
 const ChatContainer = styled(Paper)(({ theme }) => ({
-    height: '500px',
+    height: '100%',
     display: 'flex',
     flexDirection: 'column',
     overflow: 'hidden',
@@ -31,13 +30,15 @@ const MessagesContainer = styled(Box)(({ theme }) => ({
 const Message = styled(Box, {
     shouldForwardProp: (prop) => prop !== 'isUser',
 })<{ isUser?: boolean }>(({ theme, isUser }) => ({
-    maxWidth: '80%',
+    maxWidth: '90%',
     alignSelf: isUser ? 'flex-end' : 'flex-start',
     backgroundColor: isUser ? theme.palette.primary.main : theme.palette.grey[100],
     color: isUser ? theme.palette.primary.contrastText : theme.palette.text.primary,
     padding: theme.spacing(1.5),
     borderRadius: theme.spacing(2),
     position: 'relative',
+    marginBottom: theme.spacing(1),
+    wordBreak: 'break-word',
 }));
 
 const InputContainer = styled(Box)(({ theme }) => ({
@@ -47,25 +48,16 @@ const InputContainer = styled(Box)(({ theme }) => ({
     gap: theme.spacing(1),
 }));
 
-interface ChatMessage {
-    id: string;
-    text: string;
-    isUser: boolean;
-    timestamp: Date;
-}
-
 interface ChatPanelProps {
-    sessionId: string;
-    onSendMessage: (message: string) => Promise<void>;
-    loading?: boolean;
-    messages: ChatMessage[];
+    messages: Array<{role: string; content: string}>;
+    onSendMessage: (message: string) => void;
+    disabled?: boolean;
 }
 
 export const ChatPanel: React.FC<ChatPanelProps> = ({
-    sessionId,
-    onSendMessage,
-    loading = false,
     messages,
+    onSendMessage,
+    disabled = false,
 }) => {
     const [input, setInput] = useState('');
     const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -78,15 +70,11 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
         scrollToBottom();
     }, [messages]);
 
-    const handleSend = async () => {
-        if (!input.trim()) return;
+    const handleSend = () => {
+        if (!input.trim() || disabled) return;
 
-        try {
-            await onSendMessage(input);
-            setInput('');
-        } catch (error) {
-            console.error('Failed to send message:', error);
-        }
+        onSendMessage(input);
+        setInput('');
     };
 
     const handleKeyPress = (event: React.KeyboardEvent) => {
@@ -99,24 +87,33 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
     return (
         <ChatContainer elevation={0}>
             <MessagesContainer>
-                {messages.map((message) => (
-                    <Message key={message.id} isUser={message.isUser}>
-                        <Typography variant="body1">{message.text}</Typography>
-                        <Typography
-                            variant="caption"
+                {messages.map((message, index) => {
+                    const isUser = message.role === 'user';
+                    const isSystem = message.role === 'system';
+                    
+                    return (
+                        <Message 
+                            key={index} 
+                            isUser={isUser}
                             sx={{
-                                position: 'absolute',
-                                bottom: -20,
-                                right: message.isUser ? 8 : 'auto',
-                                left: message.isUser ? 'auto' : 8,
-                                color: 'text.secondary',
+                                backgroundColor: isSystem 
+                                    ? 'rgba(0, 0, 0, 0.05)' 
+                                    : isUser 
+                                        ? (theme) => theme.palette.primary.main 
+                                        : (theme) => theme.palette.grey[100],
+                                color: isSystem
+                                    ? (theme) => theme.palette.text.secondary
+                                    : isUser
+                                        ? (theme) => theme.palette.primary.contrastText
+                                        : (theme) => theme.palette.text.primary,
+                                fontStyle: isSystem ? 'italic' : 'normal',
                             }}
                         >
-                            {message.timestamp.toLocaleTimeString()}
-                        </Typography>
-                    </Message>
-                ))}
-                {loading && (
+                            <Typography variant="body1">{message.content}</Typography>
+                        </Message>
+                    );
+                })}
+                {disabled && (
                     <Box display="flex" justifyContent="center" my={2}>
                         <CircularProgress size={24} />
                     </Box>
@@ -132,14 +129,14 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
                     value={input}
                     onChange={(e) => setInput(e.target.value)}
                     onKeyPress={handleKeyPress}
-                    disabled={loading}
+                    disabled={disabled}
                     variant="outlined"
                     size="small"
                 />
                 <IconButton
                     color="primary"
                     onClick={handleSend}
-                    disabled={loading || !input.trim()}
+                    disabled={disabled || !input.trim()}
                 >
                     <SendIcon />
                 </IconButton>
